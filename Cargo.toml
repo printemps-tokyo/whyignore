@@ -1,0 +1,31 @@
+[package]
+name = "whyignore"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Explain which .gitignore rule matches a path, without calling Git. Fast, offline Rust CLI."
+authors = ["printemps.tokyo <develop@printemps.tokyo>"]
+repository = "https://github.com/printemps-tokyo/whyignore"
+homepage = "https://github.com/printemps-tokyo/whyignore"
+readme = "README.md"
+keywords = ["gitignore", "ignore", "glob", "git", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "whyignore"
+path = "src/main.rs"
+
+[lib]
+name = "whyignore"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

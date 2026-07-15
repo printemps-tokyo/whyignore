@@ -104,18 +104,14 @@ fn glob_to_regex(body: &str) -> Option<String> {
                 // literally instead of being interpreted as glob syntax.
                 let mut chars = rest.chars();
                 chars.next();
-                match chars.next() {
-                    Some(next) => {
-                        if "\\.+*?()[]{}|^$".contains(next) {
-                            out.push('\\');
-                        }
-                        out.push(next);
-                        rest = &rest[1 + next.len_utf8()..];
-                        continue;
-                    }
-                    // A pattern ending in a lone backslash matches nothing.
-                    None => return None,
+                // A pattern ending in a lone backslash matches nothing.
+                let next = chars.next()?;
+                if "\\.+*?()[]{}|^$".contains(next) {
+                    out.push('\\');
                 }
+                out.push(next);
+                rest = &rest[1 + next.len_utf8()..];
+                continue;
             }
             _ => {
                 if "\\.+(){}|^$".contains(c) {

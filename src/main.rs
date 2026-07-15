@@ -64,13 +64,17 @@ fn render_text(results: &[(String, bool, Decision)]) -> String {
         .min(48);
     let mut out = String::new();
     for (path, _is_dir, dec) in results {
-        let label = if dec.ignored { "IGNORED" } else { "tracked" };
+        let label = if dec.ignored {
+            "IGNORED"
+        } else {
+            "not ignored"
+        };
         let detail = match &dec.matched {
             Some(m) if dec.ignored => format!("line {}: {}", m.line_no, m.raw),
             Some(m) => format!("re-included by line {}: {}", m.line_no, m.raw),
             None => "no matching rule".to_string(),
         };
-        out.push_str(&format!("{path:<width$}  {label}  {detail}\n"));
+        out.push_str(&format!("{path:<width$}  {label:<11}  {detail}\n"));
     }
     out
 }

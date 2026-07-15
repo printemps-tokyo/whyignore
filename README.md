@@ -10,10 +10,10 @@ which line of a `.gitignore` decides each path:
 
 ```console
 $ whyignore .gitignore build/app.log keep.log docs/README.md src/main.rs
-build/app.log     IGNORED  line 2: build/
-keep.log          tracked  re-included by line 4: !keep.log
-docs/README.md    tracked  re-included by line 7: !docs/README.md
-src/main.rs       tracked  no matching rule
+build/app.log     IGNORED      line 2: build/
+keep.log          not ignored  re-included by line 4: !keep.log
+docs/README.md    not ignored  re-included by line 7: !docs/README.md
+src/main.rs       not ignored  no matching rule
 ```
 
 It implements gitignore semantics directly (anchoring, `**`, negation,
@@ -64,7 +64,8 @@ because patterns like `build/` only match directories.
 - A trailing `/` restricts a pattern to directories.
 - `!` re-includes a previously excluded path.
 - Comments (`#`) and blank lines are skipped; `\#` / `\!` escape a literal
-  first character.
+  first character, and `\` escapes any glob metacharacter (e.g. `foo\*bar`
+  matches the literal name `foo*bar`).
 
 The decision uses Git's rules: the last matching pattern wins, and — like Git —
 a file cannot be re-included if one of its parent directories is excluded.

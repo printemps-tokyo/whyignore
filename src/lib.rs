@@ -82,6 +82,21 @@ fn glob_to_regex(body: &str) -> String {
                     }
                     out.push_str("\\["); // no closing bracket: literal
                 }
+                '\\' => {
+                    // A backslash escapes the next character: it is matched
+                    // literally instead of being interpreted as glob syntax.
+                    if i + 1 < n {
+                        let next = bytes[i + 1] as char;
+                        if "\\.+*?()[]{}|^$".contains(next) {
+                            out.push('\\');
+                        }
+                        out.push(next);
+                        i += 2;
+                        continue;
+                    }
+                    // A trailing backslash matches a literal backslash.
+                    out.push_str("\\\\");
+                }
                 _ => {
                     if "\\.+(){}|^$".contains(c) {
                         out.push('\\');
@@ -299,9 +314,34 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_path_is_tracked() {
+    fn unmatched_path_is_not_ignored() {
         let dec = evaluate("src/main.rs", false, &rules("*.log\nbuild/\n"));
         assert!(!dec.ignored);
         assert!(dec.matched.is_none());
+    }
+
+    #[test]
+    fn backslash_escapes_a_glob_metacharacter() {
+        // `foo\*bar` means a literal `*`, not a wildcard.
+        let text = "foo\\*bar";
+        assert!(ignored("foo*bar", false, text));
+        assert!(!ignored("fooXbar", false, text));
+        assert!(!ignored("foobar", false, text));
+    }
+
+    #[test]
+    fn escaped_leading_hash_matches_literal_hash() {
+        let text = "\\#name";
+        assert!(ignored("#name", false, text));
+        assert!(!ignored("name", false, text));
+    }
+
+    #[test]
+    fn escaped_leading_bang_matches_literal_bang() {
+        let text = "\\!important";
+        let dec = evaluate("!important", false, &rules(text));
+        assert!(dec.ignored);
+        assert!(!dec.matched.unwrap().negated);
+        assert!(!ignored("important", false, text));
     }
 }

@@ -33,81 +33,100 @@ impl Rule {
     }
 }
 
+/// Copy a `[...]` character class from the start of `rest` (which begins with
+/// `[`) into `out`, mapping a leading `!` to regex `^`. Returns the number of
+/// bytes consumed, or `None` when the class is never closed.
+fn copy_char_class(rest: &str, out: &mut String) -> Option<usize> {
+    let mut class = String::from("[");
+    let mut iter = rest.char_indices().skip(1).peekable();
+    if let Some(&(_, c)) = iter.peek() {
+        if c == '!' || c == '^' {
+            class.push('^');
+            iter.next();
+        }
+    }
+    while let Some((j, c)) = iter.next() {
+        match c {
+            ']' => {
+                class.push(']');
+                out.push_str(&class);
+                return Some(j + 1);
+            }
+            '\\' => {
+                // An escaped character (including `]`) stays inside the class.
+                // A backslash at the very end leaves the class unclosed.
+                let (_, escaped) = iter.next()?;
+                class.push('\\');
+                class.push(escaped);
+            }
+            _ => class.push(c),
+        }
+    }
+    None
+}
+
 /// Translate a gitignore glob body into a regex that matches one path string.
-fn glob_to_regex(body: &str) -> String {
-    let bytes = body.as_bytes();
+///
+/// Returns `None` when the pattern can never match anything: git's wildmatch
+/// aborts on a pattern that ends in a lone backslash, so such a rule matches
+/// no path at all.
+fn glob_to_regex(body: &str) -> Option<String> {
     let mut out = String::new();
-    let mut i = 0;
-    let n = bytes.len();
-    while i < n {
-        let rest = &body[i..];
-        if let Some(stripped) = rest.strip_prefix("**/") {
-            let _ = stripped;
+    let mut rest = body;
+    while let Some(c) = rest.chars().next() {
+        if let Some(tail) = rest.strip_prefix("**/") {
             out.push_str("(?:.*/)?");
-            i += 3;
-        } else if rest == "/**" {
+            rest = tail;
+            continue;
+        }
+        if rest == "/**" {
             out.push_str("/.*");
-            i += 3;
-        } else if rest.starts_with("**") {
+            break;
+        }
+        if let Some(tail) = rest.strip_prefix("**") {
             out.push_str(".*");
-            i += 2;
-        } else {
-            let c = bytes[i] as char;
-            match c {
-                '*' => out.push_str("[^/]*"),
-                '?' => out.push_str("[^/]"),
-                '[' => {
-                    // Copy a character class, mapping a leading `!` to regex `^`.
-                    let mut j = i + 1;
-                    let mut class = String::from("[");
-                    if j < n && (bytes[j] == b'!' || bytes[j] == b'^') {
-                        class.push('^');
-                        j += 1;
-                    }
-                    while j < n && bytes[j] != b']' {
-                        if bytes[j] == b'\\' && j + 1 < n {
-                            class.push('\\');
-                            class.push(bytes[j + 1] as char);
-                            j += 2;
-                        } else {
-                            class.push(bytes[j] as char);
-                            j += 1;
-                        }
-                    }
-                    if j < n {
-                        class.push(']');
-                        out.push_str(&class);
-                        i = j + 1;
-                        continue;
-                    }
-                    out.push_str("\\["); // no closing bracket: literal
+            rest = tail;
+            continue;
+        }
+        match c {
+            '*' => out.push_str("[^/]*"),
+            '?' => out.push_str("[^/]"),
+            '[' => {
+                // Copy a character class, mapping a leading `!` to regex `^`.
+                if let Some(consumed) = copy_char_class(rest, &mut out) {
+                    rest = &rest[consumed..];
+                    continue;
                 }
-                '\\' => {
-                    // A backslash escapes the next character: it is matched
-                    // literally instead of being interpreted as glob syntax.
-                    if i + 1 < n {
-                        let next = bytes[i + 1] as char;
+                out.push_str("\\["); // no closing bracket: literal
+            }
+            '\\' => {
+                // A backslash escapes the next character: it is matched
+                // literally instead of being interpreted as glob syntax.
+                let mut chars = rest.chars();
+                chars.next();
+                match chars.next() {
+                    Some(next) => {
                         if "\\.+*?()[]{}|^$".contains(next) {
                             out.push('\\');
                         }
                         out.push(next);
-                        i += 2;
+                        rest = &rest[1 + next.len_utf8()..];
                         continue;
                     }
-                    // A trailing backslash matches a literal backslash.
-                    out.push_str("\\\\");
-                }
-                _ => {
-                    if "\\.+(){}|^$".contains(c) {
-                        out.push('\\');
-                    }
-                    out.push(c);
+                    // A pattern ending in a lone backslash matches nothing.
+                    None => return None,
                 }
             }
-            i += 1;
+            _ => {
+                if "\\.+(){}|^$".contains(c) {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
         }
+        rest = &rest[c.len_utf8()..];
     }
-    out
+    Some(out)
 }
 
 /// Parse gitignore text into compiled rules, skipping blanks and comments.
@@ -139,7 +158,11 @@ pub fn parse_rules(text: &str) -> Result<Vec<Rule>> {
         let core = s.trim_start_matches('/');
         let anchored = leading_slash || core.contains('/');
 
-        let inner = glob_to_regex(core);
+        // A pattern that can never match (lone trailing backslash) produces
+        // no rule at all, so it never appears in evaluation or --trace output.
+        let Some(inner) = glob_to_regex(core) else {
+            continue;
+        };
         let full = if anchored {
             format!("^{inner}$")
         } else {
@@ -393,6 +416,56 @@ mod tests {
         assert!(ignored("foo*bar", false, text));
         assert!(!ignored("fooXbar", false, text));
         assert!(!ignored("foobar", false, text));
+    }
+
+    #[test]
+    fn trailing_lone_backslash_matches_nothing() {
+        // Git's wildmatch aborts on `foo\`, so the pattern matches no path;
+        // the rule is dropped entirely and never appears in a trace.
+        let text = "foo\\";
+        let r = rules(text);
+        assert!(r.is_empty());
+        assert!(!ignored("foo\\", false, text));
+        assert!(!ignored("foo", false, text));
+    }
+
+    #[test]
+    fn escaped_backslash_matches_literal_backslash() {
+        // `foo\\` is an escaped backslash: it matches a file named `foo\`.
+        let text = "foo\\\\";
+        assert!(ignored("foo\\", false, text));
+        assert!(!ignored("foo", false, text));
+    }
+
+    #[test]
+    fn escaped_backslash_then_wildcard() {
+        // `foo\\*bar`: a literal backslash followed by a real wildcard.
+        let text = "foo\\\\*bar";
+        assert!(ignored("foo\\zzbar", false, text));
+        assert!(ignored("foo\\bar", false, text)); // `*` may match nothing
+        assert!(!ignored("foobar", false, text));
+    }
+
+    #[test]
+    fn non_ascii_pattern_matches_literally() {
+        let text = "foo\u{e9}bar"; // fooébar
+        assert!(ignored("foo\u{e9}bar", false, text));
+        assert!(!ignored("foobar", false, text));
+    }
+
+    #[test]
+    fn multibyte_pattern_matches_literally() {
+        let text = "日本語.md";
+        assert!(ignored("日本語.md", false, text));
+        assert!(!ignored("日本語xmd", false, text)); // the dot stays literal
+    }
+
+    #[test]
+    fn backslash_escapes_a_non_ascii_character() {
+        // `foo\é` escapes the é, which simply matches itself.
+        let text = "foo\\\u{e9}";
+        assert!(ignored("foo\u{e9}", false, text));
+        assert!(!ignored("foo", false, text));
     }
 
     #[test]

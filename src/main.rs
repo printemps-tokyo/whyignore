@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use whyignore::{evaluate, parse_rules, Decision};
+use whyignore::{evaluate_with_trace, parse_rules, Decision, TraceEntry};
 
 /// Explain which .gitignore rule matches a path, without calling Git.
 #[derive(Parser, Debug)]
@@ -25,6 +25,10 @@ struct Cli {
     /// Output JSON instead of the human-readable format.
     #[arg(long)]
     json: bool,
+
+    /// Show every matching rule in evaluation order, not just the winner.
+    #[arg(long)]
+    trace: bool,
 }
 
 fn main() -> Result<()> {
@@ -44,26 +48,30 @@ fn main() -> Result<()> {
     for path in &cli.paths {
         // A trailing slash, or an actual directory on disk, marks a directory.
         let is_dir = path.ends_with('/') || root.join(path.trim_end_matches('/')).is_dir();
-        results.push((path.clone(), is_dir, evaluate(path, is_dir, &rules)));
+        let (decision, trace) = evaluate_with_trace(path, is_dir, &rules);
+        results.push((path.clone(), is_dir, decision, trace));
     }
 
+    let ignore_name = cli.ignore_file.display().to_string();
     if cli.json {
-        print!("{}", render_json(&results));
+        print!("{}", render_json(&results, cli.trace));
     } else {
-        print!("{}", render_text(&results));
+        print!("{}", render_text(&results, cli.trace, &ignore_name));
     }
     Ok(())
 }
 
-fn render_text(results: &[(String, bool, Decision)]) -> String {
+type PathResult = (String, bool, Decision, Vec<TraceEntry>);
+
+fn render_text(results: &[PathResult], trace: bool, ignore_name: &str) -> String {
     let width = results
         .iter()
-        .map(|(p, _, _)| p.len())
+        .map(|(p, _, _, _)| p.len())
         .max()
         .unwrap_or(0)
         .min(48);
     let mut out = String::new();
-    for (path, _is_dir, dec) in results {
+    for (path, _is_dir, dec, entries) in results {
         let label = if dec.ignored {
             "IGNORED"
         } else {
@@ -75,6 +83,23 @@ fn render_text(results: &[(String, bool, Decision)]) -> String {
             None => "no matching rule".to_string(),
         };
         out.push_str(&format!("{path:<width$}  {label:<11}  {detail}\n"));
+        if trace {
+            if entries.is_empty() {
+                out.push_str("    (no rules matched)\n");
+            }
+            for (i, t) in entries.iter().enumerate() {
+                let effect = if t.negated { "re-include" } else { "ignore" };
+                let winner = if i + 1 == entries.len() {
+                    "  <- winner"
+                } else {
+                    ""
+                };
+                out.push_str(&format!(
+                    "    {ignore_name}:{}  {}  ({effect}, matched \"{}\"){winner}\n",
+                    t.line_no, t.raw, t.prefix
+                ));
+            }
+        }
     }
     out
 }
@@ -94,10 +119,10 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-fn render_json(results: &[(String, bool, Decision)]) -> String {
+fn render_json(results: &[PathResult], trace: bool) -> String {
     let items: Vec<String> = results
         .iter()
-        .map(|(path, is_dir, dec)| {
+        .map(|(path, is_dir, dec, entries)| {
             let rule = match &dec.matched {
                 Some(m) => format!(
                     "{{ \"line\": {}, \"pattern\": \"{}\", \"negated\": {} }}",
@@ -107,12 +132,32 @@ fn render_json(results: &[(String, bool, Decision)]) -> String {
                 ),
                 None => "null".to_string(),
             };
+            let trace_field = if trace {
+                let steps: Vec<String> = entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        format!(
+                            "{{ \"line\": {}, \"pattern\": \"{}\", \"negated\": {}, \"matched\": \"{}\", \"winner\": {} }}",
+                            t.line_no,
+                            json_escape(&t.raw),
+                            t.negated,
+                            json_escape(&t.prefix),
+                            i + 1 == entries.len()
+                        )
+                    })
+                    .collect();
+                format!(", \"trace\": [{}]", steps.join(", "))
+            } else {
+                String::new()
+            };
             format!(
-                "  {{ \"path\": \"{}\", \"isDir\": {}, \"ignored\": {}, \"rule\": {} }}",
+                "  {{ \"path\": \"{}\", \"isDir\": {}, \"ignored\": {}, \"rule\": {}{} }}",
                 json_escape(path),
                 is_dir,
                 dec.ignored,
-                rule
+                rule,
+                trace_field
             )
         })
         .collect();

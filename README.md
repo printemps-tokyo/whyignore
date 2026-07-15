@@ -41,6 +41,7 @@ whyignore <ignore-file> <path...>
 whyignore .gitignore build/ src/index.ts node_modules/x
 whyignore --root . .gitignore dist            # check dir-ness on disk under --root
 whyignore .gitignore docs/guide.md --json
+whyignore .gitignore keep.log --trace         # show every rule that matched
 ```
 
 | Option | Description |
@@ -49,6 +50,20 @@ whyignore .gitignore docs/guide.md --json
 | `<path...>` | One or more paths to test, relative to the ignore file's directory |
 | `--root <dir>` | Base directory used to tell whether a path is a directory on disk |
 | `--json` | Output JSON instead of the human-readable format |
+| `--trace` | Show every matching rule in evaluation order, not just the winner |
+
+`--trace` lists all rules that matched during evaluation — including the ones
+that were later overridden — which makes `!` re-include puzzles easy to debug:
+
+```console
+$ whyignore .gitignore keep.log --trace
+keep.log  not ignored  re-included by line 4: !keep.log
+    .gitignore:1  *.log  (ignore, matched "keep.log")
+    .gitignore:4  !keep.log  (re-include, matched "keep.log")  <- winner
+```
+
+With `--json`, each result additionally carries a `trace` array of
+`{ line, pattern, negated, matched, winner }` objects.
 
 A path is treated as a directory if it ends with `/`, or if it exists as a
 directory under `--root` (default: the ignore file's directory). This matters

@@ -173,6 +173,20 @@ pub struct Decision {
     pub matched: Option<MatchInfo>,
 }
 
+/// One rule that matched while evaluating a path, in evaluation order.
+///
+/// The final entry is always the rule that decided the outcome (the winner),
+/// because within each level the last matching rule wins and evaluation stops
+/// once a directory exclusion locks the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceEntry {
+    pub line_no: usize,
+    pub raw: String,
+    pub negated: bool,
+    /// The path prefix the rule matched (a parent directory or the full path).
+    pub prefix: String,
+}
+
 /// Normalize a path: drop `./`, and leading/trailing slashes.
 fn normalize(path: &str) -> String {
     let p = path.trim();
@@ -183,6 +197,17 @@ fn normalize(path: &str) -> String {
 /// Decide whether `path` is ignored, and by which rule. `is_dir` marks the
 /// final component as a directory (intermediate components are always dirs).
 pub fn evaluate(path: &str, is_dir: bool, rules: &[Rule]) -> Decision {
+    evaluate_with_trace(path, is_dir, rules).0
+}
+
+/// Like [`evaluate`], but also returns every rule that matched during the
+/// walk, in evaluation order. Useful for debugging why a negation did or did
+/// not take effect.
+pub fn evaluate_with_trace(
+    path: &str,
+    is_dir: bool,
+    rules: &[Rule],
+) -> (Decision, Vec<TraceEntry>) {
     let norm = normalize(path);
     let comps: Vec<&str> = norm.split('/').filter(|c| !c.is_empty()).collect();
 
@@ -190,6 +215,7 @@ pub fn evaluate(path: &str, is_dir: bool, rules: &[Rule]) -> Decision {
     let mut matched: Option<&Rule> = None;
     let mut locked = false;
     let mut prefix = String::new();
+    let mut trace = Vec::new();
 
     for (i, comp) in comps.iter().enumerate() {
         if locked {
@@ -206,6 +232,12 @@ pub fn evaluate(path: &str, is_dir: bool, rules: &[Rule]) -> Decision {
         for r in rules {
             if r.matches(&prefix, level_is_dir) {
                 here = Some(r);
+                trace.push(TraceEntry {
+                    line_no: r.line_no,
+                    raw: r.raw.clone(),
+                    negated: r.negated,
+                    prefix: prefix.clone(),
+                });
             }
         }
         if let Some(r) = here {
@@ -218,14 +250,15 @@ pub fn evaluate(path: &str, is_dir: bool, rules: &[Rule]) -> Decision {
         }
     }
 
-    Decision {
+    let decision = Decision {
         ignored,
         matched: matched.map(|r| MatchInfo {
             line_no: r.line_no,
             raw: r.raw.clone(),
             negated: r.negated,
         }),
-    }
+    };
+    (decision, trace)
 }
 
 #[cfg(test)]
@@ -318,6 +351,39 @@ mod tests {
         let dec = evaluate("src/main.rs", false, &rules("*.log\nbuild/\n"));
         assert!(!dec.ignored);
         assert!(dec.matched.is_none());
+    }
+
+    #[test]
+    fn trace_records_all_matching_rules_in_order() {
+        let r = rules("*.log\n!keep.log\n");
+        let (dec, trace) = evaluate_with_trace("keep.log", false, &r);
+        assert!(!dec.ignored);
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace[0].line_no, 1);
+        assert!(!trace[0].negated);
+        assert_eq!(trace[1].line_no, 2);
+        assert!(trace[1].negated);
+        // The last trace entry is the winner.
+        assert_eq!(dec.matched.unwrap().line_no, trace[1].line_no);
+    }
+
+    #[test]
+    fn trace_stops_at_an_excluded_directory() {
+        let r = rules("build/\n!build/keep.log\n");
+        let (dec, trace) = evaluate_with_trace("build/keep.log", false, &r);
+        assert!(dec.ignored);
+        // Evaluation locks at the excluded parent, so the negation on line 2
+        // is never consulted and does not appear in the trace.
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].line_no, 1);
+        assert_eq!(trace[0].prefix, "build");
+    }
+
+    #[test]
+    fn trace_is_empty_when_nothing_matches() {
+        let (dec, trace) = evaluate_with_trace("src/main.rs", false, &rules("*.log\n"));
+        assert!(!dec.ignored);
+        assert!(trace.is_empty());
     }
 
     #[test]

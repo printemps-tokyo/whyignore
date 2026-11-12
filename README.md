@@ -42,15 +42,57 @@ whyignore .gitignore build/ src/index.ts node_modules/x
 whyignore --root . .gitignore dist            # check dir-ness on disk under --root
 whyignore .gitignore docs/guide.md --json
 whyignore .gitignore keep.log --trace         # show every rule that matched
+whyignore .dockerignore docs/a.md             # Docker's rules (from the file name)
+whyignore .npmignore package-lock.json        # npm's rules and fixed lists
 ```
 
 | Option | Description |
 | --- | --- |
-| `<ignore-file>` | The `.gitignore` (or ignore-style) file to read |
+| `<ignore-file>` | The ignore file to read: `.gitignore` (or gitignore-style), `.dockerignore`, `.npmignore` |
 | `<path...>` | One or more paths to test, relative to the ignore file's directory |
 | `--root <dir>` | Base directory used to tell whether a path is a directory on disk |
 | `--json` | Output JSON instead of the human-readable format |
 | `--trace` | Show every matching rule in evaluation order, not just the winner |
+| `--style <git\|docker\|npm>` | Whose rules the file follows (default: from its name) |
+| `--no-fix` | Do not suggest how to include an ignored path |
+
+### How to include an ignored path
+
+For each ignored path, whyignore says what to change:
+
+```console
+$ whyignore .gitignore build/keep/a.txt x.log
+build/keep/a.txt  IGNORED      line 1: build/
+    to include it: line 1 `build/` excludes the directory `build/`, and Git cannot re-include a path inside an excluded directory; exclude its contents instead
+      replace line 1 with:
+        **/build/**
+        !/build/**/
+        !/build/keep/a.txt
+x.log             IGNORED      line 2: *.log
+    to include it: line 2 `*.log` matches the path itself; a later ! line re-includes it
+      add at the end:
+        !/x.log
+```
+
+When the deciding rule matches the path itself, a `!` line at the end brings it
+back. When it excludes a parent directory, Git never looks inside it, so the
+fix excludes the directory's contents instead, re-includes the directories
+below it, and then the path; other files stay ignored. The tests apply these
+fixes and check them with `git check-ignore`. With `--json`, a result carries
+`fix: { note, replaceLine, lines }`.
+
+### .dockerignore and .npmignore
+
+- `.dockerignore` (and `*.dockerignore`) follows Docker's rules, ported from
+  moby/patternmatcher: patterns are rooted at the build context (`*.md` is
+  only the top level; use `**/*.md`), a pattern matching a parent directory
+  matches everything in it, and the last matching line wins, so a `!` line can
+  re-include a file even inside an excluded directory.
+- `.npmignore` follows gitignore rules, as npm documents, and whyignore also
+  notes what npm decides regardless: `package.json`, `README` and `LICENSE`
+  are always packed; `.git`, `.npmrc`, `node_modules` and lock files are never
+  packed; files such as `.DS_Store` or `*.orig` are left out unless
+  package.json `"files"` lists them.
 
 `--trace` lists all rules that matched during evaluation — including the ones
 that were later overridden — which makes `!` re-include puzzles easy to debug:

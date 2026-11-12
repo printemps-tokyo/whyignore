@@ -10,6 +10,8 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 
+pub mod docker;
+
 /// One compiled gitignore rule.
 pub struct Rule {
     /// 1-based line number in the source file.
@@ -278,6 +280,160 @@ pub fn evaluate_with_trace(
         }),
     };
     (decision, trace)
+}
+
+/// Which tool's rules an ignore file follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Style {
+    /// `.gitignore` and other gitignore-style files.
+    Git,
+    /// `.dockerignore`: rooted patterns, re-include anywhere (see [`docker`]).
+    Docker,
+    /// `.npmignore`: gitignore rules, plus files npm always packs or drops.
+    Npm,
+}
+
+impl Style {
+    /// The style a file name implies: `.dockerignore` (or `*.dockerignore`,
+    /// as in `Dockerfile.dockerignore`), `.npmignore`, else Git.
+    pub fn for_file(name: &str) -> Style {
+        if name == ".dockerignore" || name.ends_with(".dockerignore") {
+            Style::Docker
+        } else if name == ".npmignore" {
+            Style::Npm
+        } else {
+            Style::Git
+        }
+    }
+}
+
+/// What npm does with a path regardless of `.npmignore`, from the npm docs
+/// (package.json, "files"): some files are always packed, some always left
+/// out, and some of those can never be packed.
+pub fn npm_note(path: &str) -> Option<&'static str> {
+    let norm = normalize(path);
+    let comps: Vec<&str> = norm.split('/').collect();
+    let base = comps.last().copied().unwrap_or("");
+    let at_root = comps.len() == 1;
+    let stem = base.split('.').next().unwrap_or("").to_ascii_lowercase();
+    if at_root
+        && (base == "package.json" || ["readme", "license", "licence"].contains(&stem.as_str()))
+    {
+        return Some("npm always packs this file, whatever .npmignore says");
+    }
+    const NEVER: &[&str] = &[
+        ".git",
+        ".npmrc",
+        "node_modules",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lockb",
+    ];
+    if comps.iter().any(|c| NEVER.contains(c)) {
+        return Some("npm never packs this, even if package.json \"files\" lists it");
+    }
+    let swp = base.starts_with('.') && base.ends_with(".swp");
+    let wafpickle = base.starts_with(".wafpickle-");
+    const ALWAYS_OUT: &[&str] = &[
+        ".DS_Store",
+        ".hg",
+        ".lock-wscript",
+        ".svn",
+        "CVS",
+        "config.gypi",
+        "npm-debug.log",
+    ];
+    if base.ends_with(".orig")
+        || swp
+        || base.starts_with("._")
+        || wafpickle
+        || comps.iter().any(|c| ALWAYS_OUT.contains(c))
+    {
+        return Some("npm leaves this out by default, unless package.json \"files\" lists it");
+    }
+    None
+}
+
+/// How to make an ignored path included again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fix {
+    /// What is wrong, in a sentence.
+    pub note: String,
+    /// A line to replace (1-based), when the fix changes an existing rule.
+    pub replace_line: Option<usize>,
+    /// The lines to write: in place of `replace_line`, or else appended.
+    pub lines: Vec<String>,
+}
+
+/// A pattern that matches only `path` from the ignore file's directory:
+/// anchored with a leading `/`, special characters escaped.
+fn literal_pattern(path: &str) -> String {
+    let mut out = String::from("/");
+    for c in path.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\' | '!' | '#') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// What to change so that `path` is not ignored, or None when it is not.
+pub fn suggest_fix(
+    style: Style,
+    path: &str,
+    is_dir: bool,
+    decision: &Decision,
+    trace: &[TraceEntry],
+) -> Option<Fix> {
+    if !decision.ignored {
+        return None;
+    }
+    let norm = normalize(path);
+    let target = format!(
+        "!{}{}",
+        literal_pattern(&norm),
+        if is_dir { "/" } else { "" }
+    );
+    let winner = trace.last()?;
+    if style == Style::Docker || winner.prefix == norm {
+        let note = if style == Style::Docker {
+            "Docker lets a later ! line re-include any path, so add it as the last line".to_string()
+        } else {
+            format!(
+                "line {} `{}` matches the path itself; a later ! line re-includes it",
+                winner.line_no, winner.raw
+            )
+        };
+        return Some(Fix {
+            note,
+            replace_line: None,
+            lines: vec![target],
+        });
+    }
+    // The rule excludes a parent directory. Git never looks inside an
+    // excluded directory, so exclude its contents instead, bring back the
+    // directories below it, and then the path.
+    let pattern = winner.raw.trim_end_matches('/');
+    let anchored = pattern.trim_start_matches('/').contains('/') || pattern.starts_with('/');
+    let contents = if anchored {
+        format!("{pattern}/**")
+    } else {
+        format!("**/{pattern}/**")
+    };
+    let dir = literal_pattern(&winner.prefix);
+    Some(Fix {
+        note: format!(
+            "line {} `{}` excludes the directory `{}/`, and {} cannot re-include a path inside an excluded directory; exclude its contents instead",
+            winner.line_no,
+            winner.raw,
+            winner.prefix,
+            if style == Style::Npm { "npm, like Git," } else { "Git" }
+        ),
+        replace_line: Some(winner.line_no),
+        lines: vec![contents, format!("!{dir}/**/"), target],
+    })
 }
 
 #[cfg(test)]

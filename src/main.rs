@@ -5,13 +5,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use whyignore::{evaluate_with_trace, parse_rules, Decision, TraceEntry};
+use whyignore::docker::{docker_evaluate, parse_docker_rules};
+use whyignore::{
+    evaluate_with_trace, npm_note, parse_rules, suggest_fix, Decision, Fix, Style, TraceEntry,
+};
 
 /// Explain which .gitignore rule matches a path, without calling Git.
 #[derive(Parser, Debug)]
 #[command(name = "whyignore", version, about, long_about = None)]
 struct Cli {
-    /// The .gitignore (or ignore-style) file to read.
+    /// The ignore file to read: .gitignore (or another gitignore-style file),
+    /// .dockerignore, or .npmignore.
     ignore_file: PathBuf,
 
     /// One or more paths to test (relative to the ignore file's directory).
@@ -29,6 +33,15 @@ struct Cli {
     /// Show every matching rule in evaluation order, not just the winner.
     #[arg(long)]
     trace: bool,
+
+    /// Whose rules the file follows (default: from its name; .dockerignore
+    /// is docker, .npmignore is npm, anything else git).
+    #[arg(long, value_parser = ["git", "docker", "npm"])]
+    style: Option<String>,
+
+    /// Do not suggest how to include an ignored path.
+    #[arg(long)]
+    no_fix: bool,
 }
 
 fn main() -> Result<()> {
@@ -36,7 +49,27 @@ fn main() -> Result<()> {
 
     let text = std::fs::read_to_string(&cli.ignore_file)
         .with_context(|| format!("failed to read {}", cli.ignore_file.display()))?;
-    let rules = parse_rules(&text)?;
+    let style = match cli.style.as_deref() {
+        Some("docker") => Style::Docker,
+        Some("npm") => Style::Npm,
+        Some(_) => Style::Git,
+        None => Style::for_file(
+            &cli.ignore_file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ),
+    };
+    let rules = if style == Style::Docker {
+        Vec::new()
+    } else {
+        parse_rules(&text)?
+    };
+    let docker_rules = if style == Style::Docker {
+        parse_docker_rules(&text)?
+    } else {
+        Vec::new()
+    };
 
     let root = cli
         .root
@@ -48,8 +81,29 @@ fn main() -> Result<()> {
     for path in &cli.paths {
         // A trailing slash, or an actual directory on disk, marks a directory.
         let is_dir = path.ends_with('/') || root.join(path.trim_end_matches('/')).is_dir();
-        let (decision, trace) = evaluate_with_trace(path, is_dir, &rules);
-        results.push((path.clone(), is_dir, decision, trace));
+        let (decision, trace) = if style == Style::Docker {
+            docker_evaluate(path, &docker_rules)
+        } else {
+            evaluate_with_trace(path, is_dir, &rules)
+        };
+        let fix = if cli.no_fix {
+            None
+        } else {
+            suggest_fix(style, path, is_dir, &decision, &trace)
+        };
+        let note = if style == Style::Npm {
+            npm_note(path)
+        } else {
+            None
+        };
+        results.push(PathResult {
+            path: path.clone(),
+            is_dir,
+            decision,
+            trace,
+            fix,
+            note,
+        });
     }
 
     let ignore_name = cli.ignore_file.display().to_string();
@@ -61,17 +115,25 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-type PathResult = (String, bool, Decision, Vec<TraceEntry>);
+struct PathResult {
+    path: String,
+    is_dir: bool,
+    decision: Decision,
+    trace: Vec<TraceEntry>,
+    fix: Option<Fix>,
+    note: Option<&'static str>,
+}
 
 fn render_text(results: &[PathResult], trace: bool, ignore_name: &str) -> String {
     let width = results
         .iter()
-        .map(|(p, _, _, _)| p.len())
+        .map(|r| r.path.len())
         .max()
         .unwrap_or(0)
         .min(48);
     let mut out = String::new();
-    for (path, _is_dir, dec, entries) in results {
+    for r in results {
+        let (path, dec, entries) = (&r.path, &r.decision, &r.trace);
         let label = if dec.ignored {
             "IGNORED"
         } else {
@@ -83,6 +145,19 @@ fn render_text(results: &[PathResult], trace: bool, ignore_name: &str) -> String
             None => "no matching rule".to_string(),
         };
         out.push_str(&format!("{path:<width$}  {label:<11}  {detail}\n"));
+        if let Some(note) = r.note {
+            out.push_str(&format!("    note: {note}\n"));
+        }
+        if let Some(fix) = &r.fix {
+            out.push_str(&format!("    to include it: {}\n", fix.note));
+            match fix.replace_line {
+                Some(n) => out.push_str(&format!("      replace line {n} with:\n")),
+                None => out.push_str("      add at the end:\n"),
+            }
+            for l in &fix.lines {
+                out.push_str(&format!("        {l}\n"));
+            }
+        }
         if trace {
             if entries.is_empty() {
                 out.push_str("    (no rules matched)\n");
@@ -122,7 +197,8 @@ fn json_escape(s: &str) -> String {
 fn render_json(results: &[PathResult], trace: bool) -> String {
     let items: Vec<String> = results
         .iter()
-        .map(|(path, is_dir, dec, entries)| {
+        .map(|r| {
+            let (path, is_dir, dec, entries) = (&r.path, r.is_dir, &r.decision, &r.trace);
             let rule = match &dec.matched {
                 Some(m) => format!(
                     "{{ \"line\": {}, \"pattern\": \"{}\", \"negated\": {} }}",
@@ -151,13 +227,25 @@ fn render_json(results: &[PathResult], trace: bool) -> String {
             } else {
                 String::new()
             };
+            let fix_field = match &r.fix {
+                Some(f) => format!(
+                    ", \"fix\": {{ \"note\": \"{}\", \"replaceLine\": {}, \"lines\": [{}] }}",
+                    json_escape(&f.note),
+                    f.replace_line.map_or("null".to_string(), |n| n.to_string()),
+                    f.lines.iter().map(|l| format!("\"{}\"", json_escape(l))).collect::<Vec<_>>().join(", ")
+                ),
+                None => String::new(),
+            };
+            let note_field = r.note.map_or(String::new(), |n| format!(", \"note\": \"{}\"", json_escape(n)));
             format!(
-                "  {{ \"path\": \"{}\", \"isDir\": {}, \"ignored\": {}, \"rule\": {}{} }}",
+                "  {{ \"path\": \"{}\", \"isDir\": {}, \"ignored\": {}, \"rule\": {}{}{}{} }}",
                 json_escape(path),
                 is_dir,
                 dec.ignored,
                 rule,
-                trace_field
+                trace_field,
+                fix_field,
+                note_field
             )
         })
         .collect();
